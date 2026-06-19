@@ -26,6 +26,27 @@ vi.mock('@/lib/supabase/service', () => ({
   getServiceSupabase: () => ({ from: mockFrom }),
 }));
 
+const mockDbLimit = vi.fn();
+const mockDbOrderBy = vi.fn(() => ({ limit: mockDbLimit }));
+const mockDbGroupBy = vi.fn(() => ({ orderBy: mockDbOrderBy }));
+const mockDbWhere = vi.fn(() => ({ groupBy: mockDbGroupBy }));
+const mockDbInnerJoin = vi.fn(() => ({ where: mockDbWhere }));
+const mockDbFrom = vi.fn(() => ({ innerJoin: mockDbInnerJoin }));
+const mockDbSelect = vi.fn(() => ({ from: mockDbFrom }));
+
+const mockDb = { select: mockDbSelect };
+
+vi.mock('@/lib/db/client', () => ({
+  tryGetDb: () => mockDb,
+}));
+
+vi.mock('drizzle-orm', () => ({
+  eq: vi.fn(),
+  inArray: vi.fn(),
+  sum: vi.fn(),
+  desc: vi.fn(),
+}));
+
 vi.mock('@/lib/maintainer/detect', () => ({
   isUserMaintainer: vi.fn(),
   listMaintainerInstalls: vi.fn(),
@@ -328,9 +349,9 @@ describe('maintainer actions', () => {
       if (res.ok) expect(res.data).toEqual([]);
     });
 
-    it('returns empty array if no PRs found in scoped repos', async () => {
+    it('returns empty array if no contributions found in scoped repos', async () => {
       vi.mocked(detect.listMaintainerRepos).mockResolvedValue(['org/repo1']);
-      mockFrom.mockReturnValueOnce(chain([])); // pull_requests returns empty
+      mockDbLimit.mockResolvedValueOnce([]);
       const res = await getTopContributors({ installationId: 1 });
       expect(res.ok).toBe(true);
       if (res.ok) expect(res.data).toEqual([]);
@@ -339,15 +360,12 @@ describe('maintainer actions', () => {
     it('returns scoped contributors matching PR authors', async () => {
       vi.mocked(detect.listMaintainerRepos).mockResolvedValue(['org/repo1']);
 
-      const mockPrs = [{ author_user_id: 'user-a' }, { author_user_id: 'user-b' }];
-      const mockProfiles = [
-        { github_handle: 'alice', xp: 100, level: 2 },
-        { github_handle: 'bob', xp: 50, level: 1 },
+      const mockRows = [
+        { githubHandle: 'alice', xp: 100, level: 2 },
+        { githubHandle: 'bob', xp: 50, level: 1 },
       ];
 
-      mockFrom
-        .mockReturnValueOnce(chain(mockPrs)) // pull_requests query
-        .mockReturnValueOnce(chain(mockProfiles)); // profiles query
+      mockDbLimit.mockResolvedValueOnce(mockRows);
 
       const res = await getTopContributors({ installationId: 1 });
       expect(res.ok).toBe(true);
@@ -388,7 +406,9 @@ describe('maintainer actions', () => {
           user_id: 'user-active-pr',
           reason: 'daily_xp_event_spike',
           severity: 'medium',
-          evidence: {},
+          evidence: {
+            items: [{ repo: 'my-org/my-repo', xpDelta: 10 }],
+          },
           detected_at: '2026-05-18T00:00:00Z',
         },
         {
@@ -396,7 +416,9 @@ describe('maintainer actions', () => {
           user_id: 'user-active-rec',
           reason: 'rapid_merge_spike',
           severity: 'high',
-          evidence: {},
+          evidence: {
+            items: [{ repoFullName: 'my-org/my-repo' }],
+          },
           detected_at: '2026-05-18T01:00:00Z',
         },
         {
@@ -404,7 +426,9 @@ describe('maintainer actions', () => {
           user_id: 'user-inactive',
           reason: 'reviewer_approval_concentration',
           severity: 'medium',
-          evidence: {},
+          evidence: {
+            items: [{ repoFullName: 'some-other/repo' }],
+          },
           detected_at: '2026-05-18T02:00:00Z',
         },
       ];
