@@ -1281,16 +1281,3 @@ export async function getFlaggedAccounts(args?: {
     }),
   );
 }
-
-function readFlagEvidence(evidence: unknown) {
-  if (!evidence || typeof evidence !== 'object') {
-    return { summary: 'Suspicious activity pattern detected.', count: 0 };
-  }
-
-  const record = evidence as Record<string, unknown>;
-  return {
-    summary:
-      typeof record.summary === 'string' ? record.summary : 'Suspicious activity pattern detected.',
-    count: typeof record.count === 'number' ? record.count : 0,
-  };
-}
