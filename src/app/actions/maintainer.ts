@@ -24,6 +24,9 @@ import {
 import { inngest } from '@/inngest/client';
 import { getInstallOctokit } from '@/lib/github/app';
 import { cacheGet, cacheSet } from '@/lib/cache';
+import { tryGetDb } from '@/lib/db/client';
+import { profiles, xpEvents } from '@/lib/db/schema';
+import { eq, inArray, sum, desc } from 'drizzle-orm';
 
 import { classifyTriage, type IssueTriageBucket } from '@/lib/maintainer/issue-triage';
 import type { MaintainerAnalyticsTrends } from '@/lib/maintainer/analytics';
@@ -819,41 +822,35 @@ export async function getTopContributors(args: {
     return ok([]);
   }
 
-  const { data: prs, error: prError } = await service
-    .from('pull_requests')
-    .select('author_user_id')
-    .in('repo_full_name', repos);
-
-  if (prError) {
-    return err('query_failed', prError.message);
+  const db = tryGetDb();
+  if (!db) {
+    return err('not_configured', 'database not configured');
   }
 
-  const authorIds = Array.from(
-    new Set((prs ?? []).map((pr) => pr.author_user_id).filter((id): id is string => !!id)),
-  );
+  try {
+    const rows = await db
+      .select({
+        githubHandle: profiles.githubHandle,
+        level: profiles.level,
+        xp: sum(xpEvents.xpDelta),
+      })
+      .from(xpEvents)
+      .innerJoin(profiles, eq(xpEvents.userId, profiles.id))
+      .where(inArray(xpEvents.repo, repos))
+      .groupBy(profiles.id, profiles.githubHandle, profiles.level)
+      .orderBy(desc(sum(xpEvents.xpDelta)))
+      .limit(5);
 
-  if (authorIds.length === 0) {
-    return ok([]);
+    return ok(
+      rows.map((row) => ({
+        githubHandle: row.githubHandle ?? 'unknown',
+        xp: row.xp ? Number(row.xp) : 0,
+        level: row.level ?? 0,
+      })),
+    );
+  } catch (error: any) {
+    return err('query_failed', error.message || 'Drizzle query failed');
   }
-
-  const { data: contributors, error } = await service
-    .from('profiles')
-    .select('github_handle, xp, level')
-    .in('id', authorIds)
-    .order('xp', { ascending: false })
-    .limit(5);
-
-  if (error) {
-    return err('query_failed', error.message);
-  }
-
-  return ok(
-    (contributors ?? []).map((c) => ({
-      githubHandle: c.github_handle ?? 'unknown',
-      xp: c.xp ?? 0,
-      level: c.level ?? 0,
-    })),
-  );
 }
 
 export async function getMaintainerAnalyticsTrends(args: {
@@ -1206,7 +1203,18 @@ export async function getFlaggedAccounts(args?: {
     }
   }
 
-  const allowedFlags = flags.filter((flag) => flag.user_id && activeUserIds.has(flag.user_id));
+  const allowedFlags = flags.filter((flag) => {
+    if (!flag.user_id || !activeUserIds.has(flag.user_id)) {
+      return false;
+    }
+    const evidence = flag.evidence as any;
+    const items = Array.isArray(evidence?.items) ? evidence.items : [];
+    return items.some((item: any) => {
+      const r = item.repo || item.repoFullName;
+      return typeof r === 'string' && repos.includes(r);
+    });
+  });
+
   const limitedFlags = allowedFlags.slice(0, 10);
 
   const allowedUserIds = Array.from(
@@ -1238,7 +1246,26 @@ export async function getFlaggedAccounts(args?: {
   return ok(
     limitedFlags.map((flag) => {
       const profile = profilesById.get(flag.user_id ?? '');
-      const evidence = readFlagEvidence(flag.evidence);
+
+      const evidence = flag.evidence as any;
+      const items = Array.isArray(evidence?.items) ? evidence.items : [];
+      const filteredItems = items.filter((item: any) => {
+        const r = item.repo || item.repoFullName;
+        return typeof r === 'string' && repos.includes(r);
+      });
+      const count = filteredItems.length;
+      let summary = 'Suspicious activity pattern detected.';
+      if (flag.reason === 'daily_xp_event_spike') {
+        const totalXp = filteredItems.reduce(
+          (sum: number, item: any) => sum + (item.xpDelta ?? 0),
+          0,
+        );
+        summary = `${count} XP event${count === 1 ? '' : 's'} in one UTC day (${totalXp} XP total).`;
+      } else if (flag.reason === 'rapid_merge_spike') {
+        summary = `${count} merged PR${count === 1 ? '' : 's'} landed inside one hour.`;
+      } else if (flag.reason === 'reviewer_approval_concentration') {
+        summary = `${count} approval${count === 1 ? '' : 's'} from the same reviewer in one week.`;
+      }
 
       return {
         id: flag.id,
@@ -1248,8 +1275,8 @@ export async function getFlaggedAccounts(args?: {
         reason: flag.reason,
         severity: flag.severity === 'high' ? 'high' : 'medium',
         detectedAt: flag.detected_at,
-        summary: evidence.summary,
-        count: evidence.count,
+        summary: summary,
+        count: count,
       };
     }),
   );
